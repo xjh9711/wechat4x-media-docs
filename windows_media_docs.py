@@ -10,11 +10,13 @@
 - 文件消息落盘在 msg/file/<年-月>/ 下, 使用原始文件名 (重名加 (n))。
 - 图片落盘在 msg/attach/<md5(chatroom)>/<年-月>/Img/<name>.dat;
   name = 图片内容 md5; 变体后缀: 无=mid, _t=缩略, _h=HD 原图。
-- .dat 结构 (部分样本): 31B 固定壳(magic 07 08 56 32)+16B 图片组指纹+
-  明文 EXIF(真实宽高在 tag 0x100/0x101)+伪装 SOF0(宽高被改小)+
-  明文 JPEG 熵编码主体。
-- 大量 .dat 为整文件加密 (AES, 密钥与消息 XML aeskey/db key/进程 hex 候选
-  均不同源, 2026-11 时点未能解出; 不要再尝试单字节 XOR——4.x 不是 3.x)。
+- .dat 结构: 31B 固定壳(magic 07 08 56 32)+16B 档位指纹(明文)+
+  档位模板区(1024B)+数据区。**加密=对数据区(尾部 max 1MB)做单字节 XOR 0xE5**
+  （2026-11-03 实测; 证据: 尾部 FF D9^E5=1a3c, 全库 133 会话同一常数;
+  早期部分 _h 主体明文, 是"解密进度"残留, 不是独立机制）。
+- 解密: `decrypt_dat(path)`——XOR 尾区+档位模板装配+win_dims.json 指纹查表
+  得宽高（2026-11-03 实测 _t 约 2/3 直接可解, 其余需扩表）。
+  mid 档为 HEIF/HEVC 容器（消息 XML 的 hevc_mid_size），独立子问题未解。
 
 能力边界:
 - plaintext / size-spoofed 两类可直接提取; encrypted 类只能拿明文缩略图缓存
@@ -276,3 +278,107 @@ def _selftest():
 
 if __name__ == "__main__":
     _selftest()
+
+
+# ---- 4.x 图片解密（XOR 0xE5 尾区 + 档位装配; 2026-11-03 验证 _t 41/58）----
+_WX_DHT00 = bytes.fromhex("ffc4001f0000010501010101010100000000000000000102030405060708090a0b")
+_WX_DHT10 = bytes.fromhex("ffc400b5100002010303020403050504040000017d01020300041105122131410613516107227114328191a1082342b1c11552d1f02433627282090a161718191a25262728292a3435363738393a434445464748494a535455565758595a636465666768696a737475767778797a838485868788898a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8e9eaf1f2f3f4f5f6f7f8f9fa")
+_WX_DHT01 = bytes.fromhex("ffc4001f0100030101010101010101010000000000000102030405060708090a0b")
+_WX_DHT11 = bytes.fromhex("ffc400b51100020102040403040705040400010277000102031104052131061241510761711322328108144291a1b1c109233352f0156272d10a162434e125f11718191a262728292a35363738393a434445464748494a535455565758595a636465666768696a737475767778797a82838485868788898a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae2e3e4e5e6e7e8e9eaf2f3f4f5f6f7f8f9fa")
+_WX_DQT0 = bytes.fromhex("ffdb00430006040506050406060506070706080a100a0a09090a140e0f0c1017141818171416161a1d251f1a1b231c1616202c20232627292a29191f2d302d283025282928")
+_WX_DQT1 = bytes.fromhex("ffdb0043010707070a080a130a0a13281a161a2828282828282828282828282828282828282828282828282828282828282828282828282828282828282828282828282828")
+_WX_SOS = bytes.fromhex("ffda000c03010002110311003f00")
+_WX_APP0 = bytes.fromhex("ffe000104a46494600010100000100010000")
+_XOR_KEY = 0xE5
+_HEADER_ZONE = 1055  # 壳(31)+档位模板(1024) 之后为数据区
+# ponytail: 仅 _t 档装配; mid(HEIF) 与 _h 全尺寸装配待需要时补
+
+def _xor_e5(d):
+    return bytes(b ^ _XOR_KEY for b in d)
+
+def _build_sof(w, h, sampling=0x22):
+    return bytes.fromhex("ffc0") + struct.pack(">H", 17) + bytes([8]) + struct.pack(">HH", h, w) + bytes([3, 1, sampling, 0, 2, 0x11, 1, 3, 0x11, 1])
+
+def _harvest_chain(payload):
+    segs = {}
+    sos = None
+    i = 0
+    while i < min(len(payload) - 4, 1200):
+        if payload[i] == 0xFF and payload[i+1] not in (0x00, 0xFF) and not (0xD0 <= payload[i+1] <= 0xD9):
+            m = payload[i+1]
+            if m == 0xD8:
+                i += 2
+                continue
+            ln = struct.unpack(">H", payload[i+2:i+4])[0]
+            if ln < 2 or i + 2 + ln > len(payload):
+                break
+            if m == 0xDA:
+                sos = i
+                break
+            key = {0xC0: "SOF0", 0xC4: "DHT%02x" % payload[i+4], 0xDB: "DQT%02x" % payload[i+4], 0xDD: "DRI"}.get(m)
+            if key:
+                segs.setdefault(key, (i, ln))
+            i += 2 + ln
+        else:
+            i += 1
+    return segs, sos
+
+_WIN_DIMS = None
+
+
+def _load_win_dims():
+    global _WIN_DIMS
+    if _WIN_DIMS is None:
+        import json
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "win_dims.json")
+        _WIN_DIMS = {}
+        for k, v in json.load(open(path, encoding="utf-8")).items():
+            try:
+                a, b = k.split("|", 1)
+                key = (eval(a, {"__builtins__": {}}, {"b": bytes}), eval(b, {"__builtins__": {}}, {"b": bytes}))
+                _WIN_DIMS[key] = tuple(v)
+            except Exception:
+                continue  # ponytail: 脏键跳过，表覆盖常见分辨率即可
+    return _WIN_DIMS
+
+
+def _dims_from_winmap(data):
+    key = (data[31:47][:8], data[783:799])
+    return _load_win_dims().get(key, (None, None))
+
+
+def decrypt_dat(path, w=None, h=None):
+    """解密 _t 缩略图档 .dat -> JPEG bytes。
+
+    宽高解析序: 显式 w/h > 内置 win_dims.json 模板指纹查表。
+    查表不中且未显式传入 -> MediaError。mid 档为 HEIF、_h 全尺寸装配未实现。
+    """
+    size = os.path.getsize(path)
+    if size > 64_000_000:
+        raise MediaError("dat too large")
+    data = open(path, "rb").read()
+    if not data.startswith(MAGIC):
+        raise MediaError("not a wechat dat")
+    if w is None or h is None:
+        w, h = _dims_from_winmap(data)
+    if not w or not h:
+        raise MediaError("dims unknown: pass w/h from message XML or extend win_dims.json")
+    enc_len = int.from_bytes(data[10:14], "little")
+    start = len(data) - (enc_len if enc_len else len(data) - _HEADER_ZONE)
+    payload = _xor_e5(data[start:])
+    segs, sos = _harvest_chain(payload)
+    if sos is not None:
+        parts = [bytes.fromhex("ffd8"), _WX_APP0]
+        for k, fb in (("DQT00", _WX_DQT0), ("DQT01", _WX_DQT1)):
+            parts.append(payload[segs[k][0]:segs[k][0]+2+segs[k][1]] if k in segs else fb)
+        parts.append(_build_sof(w, h))
+        for k, fb in (("DHT00", _WX_DHT00), ("DHT10", _WX_DHT10), ("DHT01", _WX_DHT01), ("DHT11", _WX_DHT11)):
+            parts.append(payload[segs[k][0]:segs[k][0]+2+segs[k][1]] if k in segs else fb)
+        if "DRI" in segs:
+            parts.append(payload[segs["DRI"][0]:segs["DRI"][0]+2+segs["DRI"][1]])
+        parts.append(payload[sos:])
+    else:
+        parts = [bytes.fromhex("ffd8"), _WX_APP0, _WX_DQT0, _WX_DQT1, _build_sof(w, h),
+                 _WX_DHT00, _WX_DHT10, _WX_DHT01, _WX_DHT11,
+                 bytes.fromhex("ffdd0004000a"), _WX_SOS, payload]
+    return b"".join(parts)
